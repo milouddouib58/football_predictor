@@ -13,9 +13,6 @@ from .utils import log
 
 
 class AnalysisCache:
-    """
-    كاش خفيف لبنود التحليل مع آلية TTL وآمنة على الخيوط (threads).
-    """
     def __init__(self) -> None:
         self.cache: Dict[str, Any] = {}
         self._lock = threading.Lock()
@@ -41,12 +38,6 @@ class AnalysisCache:
 
 
 class FootballDataClient:
-    """
-    عميل HTTP مع:
-    - كاش داخلي قابل للتهيئة.
-    - احترام حدود المعدّل.
-    - إعادة المحاولة عند أخطاء الشبكة المؤقتة.
-    """
     def __init__(self, api_key: str, min_interval: float, cache: Optional[AnalysisCache] = None, default_ttl: int = 3600):
         self.headers = {
             "X-Auth-Token": api_key,
@@ -81,13 +72,11 @@ class FootballDataClient:
         url = f"{BASE_URL}{path}"
         cache_key = self._cache_key(path, params)
 
-        # محاولة جلب من الكاش أولاً
         if self.cache:
             cached = self.cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        # احترام الحد الأدنى للفواصل بين الاتصالات
         with self._lock:
             delta = time.time() - self._last_call_ts
             if delta < self.min_interval:
