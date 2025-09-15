@@ -77,17 +77,15 @@ class FootballDataClient:
             return path
         return f"{path}?{urlencode(sorted(params.items()))}"
 
-    def make_request(self, path: str, params: Optional[Dict] = None, ttl: Optional[int] = None) -> Optional[Dict]:
+    def make_request(self, path: str, params: Optional[Dict] = None, ttl: Optional[int] = None) -> Dict:
         url = f"{BASE_URL}{path}"
         cache_key = self._cache_key(path, params)
 
-        # محاولة جلب من الكاش أولاً
         if self.cache:
             cached = self.cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        # احترام الحد الأدنى للفواصل بين الاتصالات
         with self._lock:
             delta = time.time() - self._last_call_ts
             if delta < self.min_interval:
@@ -96,20 +94,35 @@ class FootballDataClient:
 
         try:
             resp = self.session.get(url, headers=self.headers, params=params, timeout=25)
-            if resp.status_code == 429:
-                wait_sec = int(resp.headers.get("Retry-After", 60))
-                log(f"Rate limit hit. Waiting {wait_sec}s...")
-                time.sleep(wait_sec)
-                return self.make_request(path, params=params, ttl=ttl)
-
+            
+            # سيقوم هذا السطر بإطلاق استثناء (exception) إذا كان الرد خطأ (مثل 403, 404, 500)
             resp.raise_for_status()
+            
             data = resp.json()
             if self.cache:
                 self.cache.set(cache_key, data, ttl_seconds=(ttl or self.default_ttl))
             return data
+
+        except requests.exceptions.HTTPError as e:
+            # هنا نلتقط أخطاء الـ API مثل (خطأ في الصلاحية، الصفحة غير موجودة)
+            error_message = f"API Error: {e.response.status_code} - {e.response.reason}."
+            try:
+                # محاولة قراءة رسالة الخطأ التفصيلية من الـ API
+                api_error_details = e.response.json().get("message")
+                if api_error_details:
+                    error_message += f" Details: {api_error_details}"
+            except requests.exceptions.JSONDecodeError:
+                # في حال لم يرسل الـ API رسالة JSON
+                error_message += f" Details: {e.response.text}"
+            
+            log(error_message)
+            # نطلق استثناء جديد بالرسالة الواضحة ليظهر في الواجهة
+            raise ConnectionError(error_message) from e
+
         except requests.exceptions.RequestException as e:
-            log(f"Request error for {url}: {e}")
-            return None
+            # هنا نلتقط أخطاء الشبكة (مثل انقطاع الإنترنت، فشل DNS)
+            log(f"Network request error for {url}: {e}")
+            raise ConnectionError(f"Network error while connecting to the API: {e}") from e
 
     def clear_cache(self) -> None:
         if self.cache:
