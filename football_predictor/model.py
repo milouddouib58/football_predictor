@@ -186,22 +186,34 @@ class PredictionModel:
         history_match_limit: int,
         prior_games: int,
     ) -> Dict:
-        start_season, _end_season, comp_name = self._get_competition_season_dates(comp_id)
         today = datetime.utcnow().strftime("%Y-%m-%d")
+        start_season, _end_season, comp_name = self._get_competition_season_dates(comp_id)
 
+        # START of FIX: Implement fallback logic for fetching matches
+        date_from_candidate = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        date_from = date_from_candidate
         if use_season_dates:
-            date_from_candidate = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
             date_from = max(start_season, date_from_candidate)
-        else:
-            date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
         matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
         matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
+
+        # Fallback: If not enough matches in the current season window, expand the search.
+        if len(matches_sorted) < 20 and use_season_dates:
+            log(f"Found only {len(matches_sorted)} matches since season start. Expanding lookback to include previous season data.")
+            # Revert to the full lookback period, ignoring the season start date.
+            date_from = date_from_candidate
+            matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
+            matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
+        # END of FIX
+
         if history_match_limit and len(matches_sorted) > history_match_limit:
             matches_sorted = matches_sorted[-history_match_limit:]
 
+        # Final check after potential fallback
         if len(matches_sorted) < 20:
-            raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches_sorted)} مباراة فقط).")
+            # Add a more helpful error message
+            raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches_sorted)} مباراة فقط). جرب زيادة 'عدد الأيام للتاريخ' في الإعدادات.")
 
         league_avgs = self._calculate_league_averages(matches_sorted)
         A, D = self._build_iterative_team_factors(matches_sorted, league_avgs, prior_games)
@@ -216,6 +228,7 @@ class PredictionModel:
             "D": D,
             "elo": elo_ratings,
         }
+
 
     # --- Main Prediction for a single match ---
     def predict(self, comp_id: int, home_team_id: int, away_team_id: int, advanced_settings: Dict) -> Dict:
