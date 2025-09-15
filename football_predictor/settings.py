@@ -1,15 +1,18 @@
-# file: football_predictor/settings.py
-VERSION = "11.0-Final-Full-Logic"
+VERSION = "12.0-Improved"
 
-# --- إعدادات الاتصال ---
+# إعدادات الاتصال
 BASE_URL = "https://api.football-data.org/v4"
-MIN_INTERVAL_SEC = 6.5
+MIN_INTERVAL_SEC = 6.5  # احترام قيود المعدل
 
-# --- إعدادات النموذج ---
-H2H_LOOKBACK_DAYS = 365
+# إعدادات TTL للكاش (بالثواني)
+TEAMS_TTL = 3600 * 6
+MATCHES_TTL = 3600 * 2
+COMP_INFO_TTL = 3600 * 24
+TEAM_DETAILS_TTL = 3600 * 24
+PREDICTION_TTL = 3600  # نتيجة التوقع نفسها
+
+# إعدادات النموذج
 PRIOR_GAMES = 12
-HALF_LIFE_DAYS = 270
-DC_RHO_MAX = 0.3
 LAM_CLAMP_MIN = 0.1
 LAM_CLAMP_MAX = 3.0
 AD_CLAMP_MIN = 0.7
@@ -19,5 +22,10 @@ ELO_LAM_MAX = 1.12
 ELO_SCALE = 0.28
 MAX_GOALS_GRID = 8
 
-# --- أولويات المسابقات ---
+# إعدادات متقدمة (قابلة للتطوير لاحقًا)
+H2H_LOOKBACK_DAYS = 365
+HALF_LIFE_DAYS = 270
+DC_RHO_MAX = 0.3
+
+# أولويات المسابقات (للاستخدام المستقبلي)
 COMPETITION_PRIORITY = ["CL", "PD", "PL", "SA", "BL1", "FL1"]
