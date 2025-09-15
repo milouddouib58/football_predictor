@@ -5,12 +5,12 @@ from typing import Dict, List, Optional, Tuple
 
 import football_predictor.settings as settings
 from football_predictor.client import AnalysisCache, FootballDataClient
-from football_predictor.utils import clamp, log, poisson_pmf
+from football_predictor.utils import clamp, log, poisson_pmf, ewma_weight
 
 
 class PredictionModel:
     """
-    منطق الجلب والتحليل والتوقع.
+    Handles all fetching, analysis, and prediction logic.
     """
     def __init__(self, client: FootballDataClient, cache: AnalysisCache):
         self.client = client
@@ -42,9 +42,7 @@ class PredictionModel:
         return None
 
     def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str, status: str) -> List[Dict]:
-        """
-        يجلب مباريات البطولة ضمن نطاق تاريخ وحالة محددة (يجب ألا يتجاوز 10 أيام).
-        """
+        """Fetches matches for a competition within a specific date range and status."""
         log(f"Fetching matches for competition {comp_id} [{status}] {date_from}..{date_to}")
         params = {"competitions": comp_id, "status": status, "dateFrom": date_from, "dateTo": date_to}
         ttl = settings.MATCHES_TTL if "FINISHED" in status else settings.SCHEDULED_TTL
@@ -52,7 +50,7 @@ class PredictionModel:
         return data.get("matches", [])
 
     def _get_historical_matches_in_chunks(self, comp_id: int, start_date: date, end_date: date) -> List[Dict]:
-        """يجلب المباريات التاريخية عن طريق تقسيم النطاق الزمني إلى أجزاء من 10 أيام."""
+        """Fetches historical matches by splitting the date range into 10-day chunks."""
         log(f"Fetching historical matches in chunks from {start_date} to {end_date} for comp {comp_id}...")
         all_matches = []
         current_end = end_date
@@ -68,12 +66,10 @@ class PredictionModel:
                 all_matches.extend(chunk_matches)
             log(f"  Fetched {len(chunk_matches)} matches for period {date_from_str} to {date_to_str}")
             
-            # كن محترمًا للـ API وانتظر قليلاً بين الطلبات
-            time.sleep(1) 
+            time.sleep(1) # Be respectful to the API
 
             current_end = current_start - timedelta(days=1)
             
-        # إزالة أي تكرارات قد تحدث عند حدود الأجزاء
         seen_ids = set()
         unique_matches = []
         for match in all_matches:
@@ -84,7 +80,6 @@ class PredictionModel:
 
         log(f"Finished fetching chunks. Total unique matches found: {len(unique_matches)}")
         return unique_matches
-
 
     def _get_competition_season_dates(self, comp_id: int) -> Tuple[str, str, str]:
         info = self.client.make_request(f"/competitions/{comp_id}", ttl=settings.COMP_INFO_TTL)
@@ -122,15 +117,19 @@ class PredictionModel:
 
         A = {tid: 1.0 for tid in team_ids}
         D = {tid: 1.0 for tid in team_ids}
+        
+        today_iso = datetime.utcnow().isoformat()
+        HALF_LIFE_DAYS = 60  # A match from 2 months ago has half the importance of a match today
 
         for _ in range(10):
-            # ... (بقية الكود هنا لم يتغير)
             new_A = A.copy()
             new_D = D.copy()
 
             for team_id in team_ids:
-                goals_scored, expected_scored = prior_games, prior_games
+                goals_scored, expected_scored = float(prior_games), float(prior_games)
                 for match in matches:
+                    weight = ewma_weight(match.get("utcDate"), today_iso, half_life_days=HALF_LIFE_DAYS)
+
                     h = (match.get("homeTeam") or {}).get("id")
                     a = (match.get("awayTeam") or {}).get("id")
                     score = (match.get("score") or {}).get("fullTime", {})
@@ -139,19 +138,21 @@ class PredictionModel:
                         continue
 
                     if team_id == h:
-                        goals_scored += int(hg)
-                        expected_scored += league_avgs["avg_home_goals"] * new_D.get(a, 1.0)
+                        goals_scored += int(hg) * weight
+                        expected_scored += (league_avgs["avg_home_goals"] * new_D.get(a, 1.0)) * weight
                     elif team_id == a:
-                        goals_scored += int(ag)
-                        expected_scored += league_avgs["avg_away_goals"] * new_D.get(h, 1.0)
+                        goals_scored += int(ag) * weight
+                        expected_scored += (league_avgs["avg_away_goals"] * new_D.get(h, 1.0)) * weight
 
                 new_A[team_id] = goals_scored / expected_scored if expected_scored > 0 else 1.0
 
             A = {tid: clamp(val, settings.AD_CLAMP_MIN, settings.AD_CLAMP_MAX) for tid, val in new_A.items()}
 
             for team_id in team_ids:
-                goals_conceded, expected_conceded = prior_games, prior_games
+                goals_conceded, expected_conceded = float(prior_games), float(prior_games)
                 for match in matches:
+                    weight = ewma_weight(match.get("utcDate"), today_iso, half_life_days=HALF_LIFE_DAYS)
+                    
                     h = (match.get("homeTeam") or {}).get("id")
                     a = (match.get("awayTeam") or {}).get("id")
                     score = (match.get("score") or {}).get("fullTime", {})
@@ -160,11 +161,11 @@ class PredictionModel:
                         continue
 
                     if team_id == h:
-                        goals_conceded += int(ag)
-                        expected_conceded += league_avgs["avg_away_goals"] * A.get(a, 1.0)
+                        goals_conceded += int(ag) * weight
+                        expected_conceded += (league_avgs["avg_away_goals"] * A.get(a, 1.0)) * weight
                     elif team_id == a:
-                        goals_conceded += int(hg)
-                        expected_conceded += league_avgs["avg_home_goals"] * A.get(h, 1.0)
+                        goals_conceded += int(hg) * weight
+                        expected_conceded += (league_avgs["avg_home_goals"] * A.get(h, 1.0)) * weight
 
                 new_D[team_id] = goals_conceded / expected_conceded if expected_conceded > 0 else 1.0
 
@@ -242,7 +243,7 @@ class PredictionModel:
             matches_sorted = matches_sorted[-history_match_limit:]
 
         if len(matches_sorted) < 20:
-            raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches_sorted)} مباراة فقط). جرب زيادة 'عدد الأيام للتاريخ' في الإعدادات.")
+            raise RuntimeError(f"Not enough match data for analysis (found {len(matches_sorted)} matches). Try increasing 'Lookback Days' in settings.")
 
         league_avgs = self._calculate_league_averages(matches_sorted)
         A, D = self._build_iterative_team_factors(matches_sorted, league_avgs, prior_games)
@@ -260,7 +261,6 @@ class PredictionModel:
 
     # --- Main Prediction for a single match ---
     def predict(self, comp_id: int, home_team_id: int, away_team_id: int, advanced_settings: Dict) -> Dict:
-        # ... (بقية الكود هنا لم يتغير)
         log(f"Starting prediction for competition {comp_id}...")
 
         elo_scale = float(advanced_settings.get("elo_scale", settings.ELO_SCALE))
@@ -359,7 +359,6 @@ class PredictionModel:
         self.cache.set(cache_key, result, ttl_seconds=settings.PREDICTION_TTL)
         return result
 
-
     # --- Upcoming fixtures helpers ---
     def get_upcoming_fixtures(self, comp_id: int, horizon_days: int) -> List[Dict]:
         today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -374,7 +373,6 @@ class PredictionModel:
         return fixtures_sorted
 
     def predict_bulk_for_scheduled(self, comp_id: int, horizon_days: int, advanced_settings: Dict) -> List[Dict]:
-        # ... (بقية الكود هنا لم يتغير)
         elo_scale = float(advanced_settings.get("elo_scale", settings.ELO_SCALE))
         prior_games = int(advanced_settings.get("prior_games", settings.PRIOR_GAMES))
         max_goals_grid = int(advanced_settings.get("max_goals_grid", settings.MAX_GOALS_GRID))
@@ -440,15 +438,24 @@ class PredictionModel:
             top_scorelines = [{"score": s, "p": round(p * 100, 1)} for s, p in scorelines[:5]]
 
             result = {
-                "meta": { "version": settings.VERSION, "competition": f"{comp_name} ({comp_id})", "generated_at": datetime.utcnow().isoformat(), "context": {"date_from": ctx["date_from"], "date_to": ctx["date_to"]}, },
+                "meta": {
+                    "version": settings.VERSION,
+                    "competition": f"{comp_name} ({comp_id})",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "context": {"date_from": ctx["date_from"], "date_to": ctx["date_to"]},
+                },
                 "date": date_iso,
                 "teams": {"home": {"id": h, "name": home_name}, "away": {"id": a, "name": away_name}},
                 "lambdas": {"home_final": round(lam_home_final, 3), "away_final": round(lam_away_final, 3)},
                 "elo": {"home_rating": round(Rh), "away_rating": round(Ra)},
-                "probabilities": { "1x2": {"home": round(p_home * 100, 1), "draw": round(p_draw * 100, 1), "away": round(p_away * 100, 1)}, "over_under": {"over_2_5": round(prob_over_2_5 * 100, 1), "under_2_5": round((1 - prob_over_2_5) * 100, 1)}, "btts": {"yes": round(prob_btts_yes * 100, 1), "no": round((1 - prob_btts_yes) * 100, 1)}, "top_scorelines": top_scorelines, },
+                "probabilities": {
+                    "1x2": {"home": round(p_home * 100, 1), "draw": round(p_draw * 100, 1), "away": round(p_away * 100, 1)},
+                    "over_under": {"over_2_5": round(prob_over_2_5 * 100, 1), "under_2_5": round((1 - prob_over_2_5) * 100, 1)},
+                    "btts": {"yes": round(prob_btts_yes * 100, 1), "no": round((1 - prob_btts_yes) * 100, 1)},
+                    "top_scorelines": top_scorelines,
+                },
             }
             results.append(result)
 
         self.cache.set(cache_key, results, ttl_seconds=settings.PREDICTION_TTL)
         return results
-
