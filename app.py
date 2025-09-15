@@ -324,6 +324,10 @@ if st.button("🧮 توقع كل المباريات المعروضة", use_conta
                     ]
                 ).sort_values("date")
                 st.dataframe(df_pred, use_container_width=True, hide_index=True)
+
+                # زر تحميل النتائج CSV
+                csv = df_pred.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ تحميل النتائج CSV", data=csv, file_name="predictions.csv", mime="text/csv")
         except Exception as e:
             st.error(f"حدث خطأ أثناء التوقع الجماعي: {e}")
             st.code(traceback.format_exc())
