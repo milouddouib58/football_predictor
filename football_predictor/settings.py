@@ -1,9 +1,9 @@
 # file: football_predictor/settings.py
-VERSION = "10.0-Streamlit-Cloud-Final"
+VERSION = "11.0-Final-Full-Logic"
 
 # --- إعدادات الاتصال ---
 BASE_URL = "https://api.football-data.org/v4"
-MIN_INTERVAL_SEC = 6.5 # منصة Streamlit تعمل على خوادم مشتركة، من الأفضل إبقاء التباعد
+MIN_INTERVAL_SEC = 6.5
 
 # --- إعدادات النموذج ---
 H2H_LOOKBACK_DAYS = 365
