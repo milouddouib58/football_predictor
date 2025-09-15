@@ -1,5 +1,5 @@
 import difflib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import football_predictor.settings as settings
@@ -10,6 +10,10 @@ from football_predictor.utils import clamp, log, poisson_pmf
 class PredictionModel:
     """
     يحتوي على منطق استخراج البيانات، بناء عوامل الفرق، وحساب الاحتمالات.
+    يدعم:
+    - توقع مباراة مفردة.
+    - توقع جماعي للمباريات القادمة ضمن أفق زمني محدد.
+    - تحكم ديناميكي في نطاق التاريخ وعدد المباريات المستخدمة للبناء.
     """
     def __init__(self, client: FootballDataClient, cache: AnalysisCache):
         self.client = client
@@ -40,20 +44,22 @@ class PredictionModel:
             return best_id
         return None
 
-    def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str) -> List[Dict]:
-        log(f"Fetching matches for competition {comp_id}")
-        params = {"competitions": comp_id, "status": "FINISHED", "dateFrom": date_from, "dateTo": date_to}
-        data = self.client.make_request("/matches", params=params, ttl=settings.MATCHES_TTL)
+    def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str, status: str = "FINISHED") -> List[Dict]:
+        """
+        جلب مباريات البطولة ضمن نطاق تاريخ وحالة محددة.
+        status يمكن أن تكون قيمة مفردة أو متعددة مفصولة بفواصل مثل: 'SCHEDULED,TIMED'
+        """
+        log(f"Fetching matches for competition {comp_id} [{status}] {date_from}..{date_to}")
+        params = {"competitions": comp_id, "status": status, "dateFrom": date_from, "dateTo": date_to}
+        ttl = settings.MATCHES_TTL if "FINISHED" in status else settings.SCHEDULED_TTL
+        data = self.client.make_request("/matches", params=params, ttl=ttl)
         return data.get("matches", []) if data else []
 
     def _get_competition_season_dates(self, comp_id: int) -> Tuple[str, str, str]:
         info = self.client.make_request(f"/competitions/{comp_id}", ttl=settings.COMP_INFO_TTL) or {}
         season = info.get("currentSeason", {}) or {}
-        start = season.get("startDate")
-        end = season.get("endDate")
-        # قيم افتراضية إذا تعذر جلب التواريخ
-        start = start or datetime.utcnow().strftime("%Y-%m-%d")
-        end = end or datetime.utcnow().strftime("%Y-%m-%d")
+        start = season.get("startDate") or datetime.utcnow().strftime("%Y-%m-%d")
+        end = season.get("endDate") or datetime.utcnow().strftime("%Y-%m-%d")
         comp_name = info.get("name", "Unknown Competition")
         return start, end, comp_name
 
@@ -177,33 +183,88 @@ class PredictionModel:
             return 0.33, 0.34, 0.33
         return p_home / total_p, p_draw / total_p, p_away / total_p
 
-    # --- Main Prediction ---
+    # --- Context building for reuse ---
+    def build_context(
+        self,
+        comp_id: int,
+        use_season_dates: bool,
+        lookback_days: int,
+        history_match_limit: int,
+        prior_games: int,
+    ) -> Dict:
+        """
+        يبني السياق (عوامل الهجوم/الدفاع، ELO، المتوسطات) لإعادة الاستخدام في عدة توقعات.
+        """
+        start_season, end_season, comp_name = self._get_competition_season_dates(comp_id)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+        if use_season_dates:
+            # ابدأ من بداية الموسم لكن لا تتجاوز lookback_days إذا كانت بداية الموسم أقدم بكثير
+            date_from_candidate = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            date_from = max(start_season, date_from_candidate)
+        else:
+            date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
+        # خذ أحدث history_match_limit مباراة
+        matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
+        if history_match_limit and len(matches_sorted) > history_match_limit:
+            matches_sorted = matches_sorted[-history_match_limit:]
+
+        if len(matches_sorted) < 20:
+            raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches_sorted)} مباراة فقط).")
+
+        league_avgs = self._calculate_league_averages(matches_sorted)
+        A, D = self._build_iterative_team_factors(matches_sorted, league_avgs, prior_games)
+        elo_ratings = self._build_elo_table(matches_sorted)
+
+        return {
+            "comp_name": comp_name,
+            "date_from": date_from,
+            "date_to": today,
+            "league_avgs": league_avgs,
+            "A": A,
+            "D": D,
+            "elo": elo_ratings,
+        }
+
+    # --- Main Prediction for a single match ---
     def predict(self, comp_id: int, home_team_id: int, away_team_id: int, advanced_settings: Dict) -> Dict:
         log(f"Starting prediction for competition {comp_id}...")
 
         elo_scale = float(advanced_settings.get("elo_scale", settings.ELO_SCALE))
         prior_games = int(advanced_settings.get("prior_games", settings.PRIOR_GAMES))
+        max_goals_grid = int(advanced_settings.get("max_goals_grid", settings.MAX_GOALS_GRID))
+        use_season_dates = bool(advanced_settings.get("use_season_dates", True))
+        lookback_days = int(advanced_settings.get("lookback_days", settings.DEFAULT_LOOKBACK_DAYS))
+        history_match_limit = int(advanced_settings.get("history_match_limit", settings.HISTORY_MATCH_LIMIT))
 
         # كاش نتيجة التوقع
-        cache_key = f"pred:{settings.VERSION}:{comp_id}:{home_team_id}:{away_team_id}:{elo_scale:.3f}:{prior_games}"
+        cache_key = (
+            f"pred:{settings.VERSION}:{comp_id}:{home_team_id}:{away_team_id}:"
+            f"{elo_scale:.3f}:{prior_games}:{max_goals_grid}:"
+            f"{use_season_dates}:{lookback_days}:{history_match_limit}"
+        )
         cached = self.cache.get(cache_key)
         if cached is not None:
             return cached
 
-        start_date, _end_date, comp_name = self._get_competition_season_dates(comp_id)
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        matches = self._get_competition_matches(comp_id, start_date, today)
+        ctx = self.build_context(
+            comp_id=comp_id,
+            use_season_dates=use_season_dates,
+            lookback_days=lookback_days,
+            history_match_limit=history_match_limit,
+            prior_games=prior_games,
+        )
 
-        if len(matches) < 20:
-            raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches)} مباراة فقط).")
-
-        league_avgs = self._calculate_league_averages(matches)
-        A, D = self._build_iterative_team_factors(matches, league_avgs, prior_games)
-        elo_ratings = self._build_elo_table(matches)
+        comp_name = ctx["comp_name"]
+        league_avgs = ctx["league_avgs"]
+        A, D = ctx["A"], ctx["D"]
+        elo_ratings = ctx["elo"]
 
         # عوامل الهجوم والدفاع
         Ah, Dh = A.get(home_team_id, 1.0), D.get(home_team_id, 1.0)
-        Aa, Da = A.get(away_team_id, 1.0), D.get(away_team_id, 1.0)  # تم إصلاح العكس
+        Aa, Da = A.get(away_team_id, 1.0), D.get(away_team_id, 1.0)  # إصلاح العكس
 
         lam_home_base = league_avgs["avg_home_goals"] * Ah * Da
         lam_away_base = league_avgs["avg_away_goals"] * Aa * Dh
@@ -219,7 +280,7 @@ class PredictionModel:
         lam_away_final = clamp(lam_away_final, settings.LAM_CLAMP_MIN, settings.LAM_CLAMP_MAX)
 
         # مصفوفة بواسون والاحتمالات
-        matrix = self._poisson_matrix(lam_home_final, lam_away_final, settings.MAX_GOALS_GRID)
+        matrix = self._poisson_matrix(lam_home_final, lam_away_final, max_goals_grid)
         p_home, p_draw, p_away = self._matrix_to_outcomes(matrix)
 
         # احتمالات إضافية
@@ -244,6 +305,7 @@ class PredictionModel:
                 "version": settings.VERSION,
                 "competition": f"{comp_name} ({comp_id})",
                 "generated_at": datetime.utcnow().isoformat(),
+                "context": {"date_from": ctx["date_from"], "date_to": ctx["date_to"]},
             },
             "teams": {
                 "home": {"id": home_team_id, "name": _pick_name(home_details)},
@@ -272,3 +334,125 @@ class PredictionModel:
         # تخزين النتيجة في الكاش
         self.cache.set(cache_key, result, ttl_seconds=settings.PREDICTION_TTL)
         return result
+
+    # --- Upcoming fixtures helpers ---
+    def get_upcoming_fixtures(self, comp_id: int, horizon_days: int) -> List[Dict]:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        future = (datetime.utcnow() + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+        statuses = "SCHEDULED,TIMED"
+        fixtures = self._get_competition_matches(comp_id, today, future, status=statuses)
+        # فلترة للتأكد من وجود هويات الفرق
+        fixtures = [
+            m
+            for m in fixtures
+            if (m.get("homeTeam") or {}).get("id") and (m.get("awayTeam") or {}).get("id")
+        ]
+        fixtures_sorted = sorted(fixtures, key=lambda x: x.get("utcDate", ""))
+        return fixtures_sorted
+
+    def predict_bulk_for_scheduled(self, comp_id: int, horizon_days: int, advanced_settings: Dict) -> List[Dict]:
+        """
+        يبني السياق مرة واحدة ثم يحسب توقع كل مباراة قادمة ضمن الأفق الزمني المحدد.
+        يستخدم أسماء الفرق من نفس استجابة المباريات لتقليل طلبات HTTP.
+        """
+        elo_scale = float(advanced_settings.get("elo_scale", settings.ELO_SCALE))
+        prior_games = int(advanced_settings.get("prior_games", settings.PRIOR_GAMES))
+        max_goals_grid = int(advanced_settings.get("max_goals_grid", settings.MAX_GOALS_GRID))
+        use_season_dates = bool(advanced_settings.get("use_season_dates", True))
+        lookback_days = int(advanced_settings.get("lookback_days", settings.DEFAULT_LOOKBACK_DAYS))
+        history_match_limit = int(advanced_settings.get("history_match_limit", settings.HISTORY_MATCH_LIMIT))
+
+        # كاش للنتيجة الجماعية
+        cache_key = (
+            f"bulk:{settings.VERSION}:{comp_id}:{horizon_days}:{elo_scale:.3f}:{prior_games}:{max_goals_grid}:"
+            f"{use_season_dates}:{lookback_days}:{history_match_limit}"
+        )
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ctx = self.build_context(
+            comp_id=comp_id,
+            use_season_dates=use_season_dates,
+            lookback_days=lookback_days,
+            history_match_limit=history_match_limit,
+            prior_games=prior_games,
+        )
+        comp_name = ctx["comp_name"]
+        league_avgs = ctx["league_avgs"]
+        A, D = ctx["A"], ctx["D"]
+        elo_ratings = ctx["elo"]
+
+        fixtures = self.get_upcoming_fixtures(comp_id, horizon_days)
+        results: List[Dict] = []
+
+        for m in fixtures:
+            h = (m.get("homeTeam") or {}).get("id")
+            a = (m.get("awayTeam") or {}).get("id")
+            home_name = (m.get("homeTeam") or {}).get("shortName") or (m.get("homeTeam") or {}).get("name")
+            away_name = (m.get("awayTeam") or {}).get("shortName") or (m.get("awayTeam") or {}).get("name")
+            date_iso = m.get("utcDate")
+
+            Ah, Dh = A.get(h, 1.0), D.get(h, 1.0)
+            Aa, Da = A.get(a, 1.0), D.get(a, 1.0)
+
+            lam_home_base = league_avgs["avg_home_goals"] * Ah * Da
+            lam_away_base = league_avgs["avg_away_goals"] * Aa * Dh
+
+            Rh, Ra = float(elo_ratings.get(h, 1500.0)), float(elo_ratings.get(a, 1500.0))
+            elo_adv = (Rh + 50.0 - Ra) / 400.0
+            elo_factor = 1.0 + elo_scale * (1.0 / (1.0 + 10 ** (-elo_adv)) - 0.5)
+
+            lam_home_final = lam_home_base * clamp(elo_factor, settings.ELO_LAM_MIN, settings.ELO_LAM_MAX)
+            lam_away_final = lam_away_base * clamp(2.0 - elo_factor, settings.ELO_LAM_MIN, settings.ELO_LAM_MAX)
+            lam_home_final = clamp(lam_home_final, settings.LAM_CLAMP_MIN, settings.LAM_CLAMP_MAX)
+            lam_away_final = clamp(lam_away_final, settings.LAM_CLAMP_MIN, settings.LAM_CLAMP_MAX)
+
+            matrix = self._poisson_matrix(lam_home_final, lam_away_final, max_goals_grid)
+            p_home, p_draw, p_away = self._matrix_to_outcomes(matrix)
+
+            size = len(matrix)
+            total_mass = sum(matrix[i][j] for i in range(size) for j in range(size)) or 1.0
+            prob_over_2_5 = sum(matrix[i][j] for i in range(size) for j in range(size) if i + j >= 3) / total_mass
+            prob_btts_yes = sum(matrix[i][j] for i in range(size) for j in range(size) if i > 0 and j > 0) / total_mass
+
+            scorelines = [(f"{i}-{j}", matrix[i][j] / total_mass) for i in range(size) for j in range(size)]
+            scorelines.sort(key=lambda x: x[1], reverse=True)
+            top_scorelines = [{"score": s, "p": round(p * 100, 1)} for s, p in scorelines[:5]]
+
+            result = {
+                "meta": {
+                    "version": settings.VERSION,
+                    "competition": f"{comp_name} ({comp_id})",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "context": {"date_from": ctx["date_from"], "date_to": ctx["date_to"]},
+                },
+                "date": date_iso,
+                "teams": {
+                    "home": {"id": h, "name": home_name},
+                    "away": {"id": a, "name": away_name},
+                },
+                "lambdas": {"home_final": round(lam_home_final, 3), "away_final": round(lam_away_final, 3)},
+                "elo": {"home_rating": round(Rh), "away_rating": round(Ra)},
+                "probabilities": {
+                    "1x2": {
+                        "home": round(p_home * 100, 1),
+                        "draw": round(p_draw * 100, 1),
+                        "away": round(p_away * 100, 1),
+                    },
+                    "over_under": {
+                        "over_2_5": round(prob_over_2_5 * 100, 1),
+                        "under_2_5": round((1 - prob_over_2_5) * 100, 1),
+                    },
+                    "btts": {
+                        "yes": round(prob_btts_yes * 100, 1),
+                        "no": round((1 - prob_btts_yes) * 100, 1),
+                    },
+                    "top_scorelines": top_scorelines,
+                },
+            }
+            results.append(result)
+
+        # كاش النتائج الجماعية
+        self.cache.set(cache_key, results, ttl_seconds=settings.PREDICTION_TTL)
+        return results
