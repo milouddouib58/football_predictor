@@ -1,3 +1,5 @@
+# football_predictor/model.py
+
 import difflib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -22,7 +24,10 @@ class PredictionModel:
     def _get_competition_teams(self, comp_id: int) -> List[Dict]:
         log(f"Fetching teams for competition {comp_id}")
         data = self.client.make_request(f"/competitions/{comp_id}/teams", ttl=settings.TEAMS_TTL)
-        return data.get("teams", []) if data else []
+        # FIX: Raise error if API call fails
+        if data is None:
+            raise ConnectionError("فشل جلب بيانات الفرق من الـ API. تأكد من صحة مفتاح API والاتصال بالإنترنت.")
+        return data.get("teams", [])
 
     def find_team_id_by_name(self, name: str, comp_id: int) -> Optional[int]:
         teams = self._get_competition_teams(comp_id)
@@ -46,16 +51,21 @@ class PredictionModel:
     def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str, status: str = "FINISHED") -> List[Dict]:
         """
         يجلب مباريات البطولة ضمن نطاق تاريخ وحالة محددة.
-        status يمكن أن تكون قيمة مفردة أو متعددة مفصولة بفواصل مثل: 'SCHEDULED,TIMED'
         """
         log(f"Fetching matches for competition {comp_id} [{status}] {date_from}..{date_to}")
         params = {"competitions": comp_id, "status": status, "dateFrom": date_from, "dateTo": date_to}
         ttl = settings.MATCHES_TTL if "FINISHED" in status else settings.SCHEDULED_TTL
         data = self.client.make_request("/matches", params=params, ttl=ttl)
-        return data.get("matches", []) if data else []
+        # FIX: Raise error if API call fails
+        if data is None:
+            raise ConnectionError("فشل جلب بيانات المباريات من الـ API. تأكد من صحة مفتاح API والاتصال بالإنترنت.")
+        return data.get("matches", [])
 
     def _get_competition_season_dates(self, comp_id: int) -> Tuple[str, str, str]:
-        info = self.client.make_request(f"/competitions/{comp_id}", ttl=settings.COMP_INFO_TTL) or {}
+        info = self.client.make_request(f"/competitions/{comp_id}", ttl=settings.COMP_INFO_TTL)
+        # FIX: Raise error if API call fails
+        if info is None:
+            raise ConnectionError("فشل جلب بيانات الموسم من الـ API. تأكد من صحة مفتاح API والاتصال بالإنترنت.")
         season = info.get("currentSeason", {}) or {}
         start = season.get("startDate") or datetime.utcnow().strftime("%Y-%m-%d")
         end = season.get("endDate") or datetime.utcnow().strftime("%Y-%m-%d")
@@ -63,7 +73,11 @@ class PredictionModel:
         return start, end, comp_name
 
     def _get_team_details(self, team_id: int) -> Dict:
-        return self.client.make_request(f"/teams/{team_id}", ttl=settings.TEAM_DETAILS_TTL) or {}
+        data = self.client.make_request(f"/teams/{team_id}", ttl=settings.TEAM_DETAILS_TTL)
+        # FIX: Raise error if API call fails
+        if data is None:
+            raise ConnectionError(f"فشل جلب تفاصيل الفريق {team_id} من الـ API.")
+        return data
 
     # --- League Averages ---
     def _calculate_league_averages(self, matches: List[Dict]) -> Dict:
@@ -189,7 +203,6 @@ class PredictionModel:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         start_season, _end_season, comp_name = self._get_competition_season_dates(comp_id)
 
-        # START of FIX: Implement fallback logic for fetching matches
         date_from_candidate = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         date_from = date_from_candidate
         if use_season_dates:
@@ -198,21 +211,16 @@ class PredictionModel:
         matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
         matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
 
-        # Fallback: If not enough matches in the current season window, expand the search.
         if len(matches_sorted) < 20 and use_season_dates:
             log(f"Found only {len(matches_sorted)} matches since season start. Expanding lookback to include previous season data.")
-            # Revert to the full lookback period, ignoring the season start date.
             date_from = date_from_candidate
             matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
             matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
-        # END of FIX
 
         if history_match_limit and len(matches_sorted) > history_match_limit:
             matches_sorted = matches_sorted[-history_match_limit:]
 
-        # Final check after potential fallback
         if len(matches_sorted) < 20:
-            # Add a more helpful error message
             raise RuntimeError(f"لا توجد بيانات مباريات كافية للتحليل (وجد {len(matches_sorted)} مباراة فقط). جرب زيادة 'عدد الأيام للتاريخ' في الإعدادات.")
 
         league_avgs = self._calculate_league_averages(matches_sorted)
@@ -228,7 +236,6 @@ class PredictionModel:
             "D": D,
             "elo": elo_ratings,
         }
-
 
     # --- Main Prediction for a single match ---
     def predict(self, comp_id: int, home_team_id: int, away_team_id: int, advanced_settings: Dict) -> Dict:
