@@ -8,13 +8,6 @@ from football_predictor.utils import clamp, log, poisson_pmf
 
 
 class PredictionModel:
-    """
-    يحتوي على منطق استخراج البيانات، بناء عوامل الفرق، وحساب الاحتمالات.
-    يدعم:
-    - توقع مباراة مفردة.
-    - توقع جماعي للمباريات القادمة ضمن أفق زمني محدد.
-    - تحكم ديناميكي في نطاق التاريخ وعدد المباريات المستخدمة للبناء.
-    """
     def __init__(self, client: FootballDataClient, cache: AnalysisCache):
         self.client = client
         self.cache = cache
@@ -45,10 +38,6 @@ class PredictionModel:
         return None
 
     def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str, status: str = "FINISHED") -> List[Dict]:
-        """
-        جلب مباريات البطولة ضمن نطاق تاريخ وحالة محددة.
-        status يمكن أن تكون قيمة مفردة أو متعددة مفصولة بفواصل مثل: 'SCHEDULED,TIMED'
-        """
         log(f"Fetching matches for competition {comp_id} [{status}] {date_from}..{date_to}")
         params = {"competitions": comp_id, "status": status, "dateFrom": date_from, "dateTo": date_to}
         ttl = settings.MATCHES_TTL if "FINISHED" in status else settings.SCHEDULED_TTL
@@ -77,7 +66,6 @@ class PredictionModel:
                 ag_sum += int(ag)
                 cnt += 1
         if cnt < 20:
-            # افتراضات معقولة في حال قلة البيانات
             return {"avg_home_goals": 1.45, "avg_away_goals": 1.15, "matches_count": cnt}
         return {"avg_home_goals": hg_sum / cnt, "avg_away_goals": ag_sum / cnt, "matches_count": cnt}
 
@@ -93,12 +81,10 @@ class PredictionModel:
         A = {tid: 1.0 for tid in team_ids}  # Attack
         D = {tid: 1.0 for tid in team_ids}  # Defense
 
-        # تكرارات بسيطة للوصول للتقارب
         for _ in range(10):
             new_A = A.copy()
             new_D = D.copy()
 
-            # تحديث الهجوم
             for team_id in team_ids:
                 goals_scored, expected_scored = prior_games, prior_games
                 for match in matches:
@@ -120,7 +106,6 @@ class PredictionModel:
 
             A = {tid: clamp(val, settings.AD_CLAMP_MIN, settings.AD_CLAMP_MAX) for tid, val in new_A.items()}
 
-            # تحديث الدفاع
             for team_id in team_ids:
                 goals_conceded, expected_conceded = prior_games, prior_games
                 for match in matches:
@@ -148,7 +133,6 @@ class PredictionModel:
     def _build_elo_table(self, matches: List[Dict]) -> Dict[int, float]:
         ratings: Dict[int, float] = {}
         K, H_adv = 20, 50
-        # ترتيب زمني
         matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
         for m in matches_sorted:
             h = (m.get("homeTeam") or {}).get("id")
@@ -192,21 +176,16 @@ class PredictionModel:
         history_match_limit: int,
         prior_games: int,
     ) -> Dict:
-        """
-        يبني السياق (عوامل الهجوم/الدفاع، ELO، المتوسطات) لإعادة الاستخدام في عدة توقعات.
-        """
-        start_season, end_season, comp_name = self._get_competition_season_dates(comp_id)
+        start_season, _end_season, comp_name = self._get_competition_season_dates(comp_id)
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
         if use_season_dates:
-            # ابدأ من بداية الموسم لكن لا تتجاوز lookback_days إذا كانت بداية الموسم أقدم بكثير
             date_from_candidate = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
             date_from = max(start_season, date_from_candidate)
         else:
             date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
         matches = self._get_competition_matches(comp_id, date_from, today, status="FINISHED")
-        # خذ أحدث history_match_limit مباراة
         matches_sorted = sorted(matches, key=lambda x: x.get("utcDate", ""))
         if history_match_limit and len(matches_sorted) > history_match_limit:
             matches_sorted = matches_sorted[-history_match_limit:]
@@ -239,7 +218,6 @@ class PredictionModel:
         lookback_days = int(advanced_settings.get("lookback_days", settings.DEFAULT_LOOKBACK_DAYS))
         history_match_limit = int(advanced_settings.get("history_match_limit", settings.HISTORY_MATCH_LIMIT))
 
-        # كاش نتيجة التوقع
         cache_key = (
             f"pred:{settings.VERSION}:{comp_id}:{home_team_id}:{away_team_id}:"
             f"{elo_scale:.3f}:{prior_games}:{max_goals_grid}:"
@@ -262,14 +240,12 @@ class PredictionModel:
         A, D = ctx["A"], ctx["D"]
         elo_ratings = ctx["elo"]
 
-        # عوامل الهجوم والدفاع
         Ah, Dh = A.get(home_team_id, 1.0), D.get(home_team_id, 1.0)
-        Aa, Da = A.get(away_team_id, 1.0), D.get(away_team_id, 1.0)  # إصلاح العكس
+        Aa, Da = A.get(away_team_id, 1.0), D.get(away_team_id, 1.0)
 
         lam_home_base = league_avgs["avg_home_goals"] * Ah * Da
         lam_away_base = league_avgs["avg_away_goals"] * Aa * Dh
 
-        # عامل ELO
         Rh, Ra = float(elo_ratings.get(home_team_id, 1500.0)), float(elo_ratings.get(away_team_id, 1500.0))
         elo_adv = (Rh + 50.0 - Ra) / 400.0
         elo_factor = 1.0 + elo_scale * (1.0 / (1.0 + 10 ** (-elo_adv)) - 0.5)
@@ -279,11 +255,9 @@ class PredictionModel:
         lam_home_final = clamp(lam_home_final, settings.LAM_CLAMP_MIN, settings.LAM_CLAMP_MAX)
         lam_away_final = clamp(lam_away_final, settings.LAM_CLAMP_MIN, settings.LAM_CLAMP_MAX)
 
-        # مصفوفة بواسون والاحتمالات
         matrix = self._poisson_matrix(lam_home_final, lam_away_final, max_goals_grid)
         p_home, p_draw, p_away = self._matrix_to_outcomes(matrix)
 
-        # احتمالات إضافية
         size = len(matrix)
         total_mass = sum(matrix[i][j] for i in range(size) for j in range(size)) or 1.0
         prob_over_2_5 = sum(matrix[i][j] for i in range(size) for j in range(size) if i + j >= 3) / total_mass
@@ -293,7 +267,6 @@ class PredictionModel:
         scorelines.sort(key=lambda x: x[1], reverse=True)
         top_scorelines = [{"score": s, "p": round(p * 100, 1)} for s, p in scorelines[:5]]
 
-        # تفاصيل الفرق
         home_details = self._get_team_details(home_team_id)
         away_details = self._get_team_details(away_team_id)
 
@@ -331,7 +304,6 @@ class PredictionModel:
             },
         }
 
-        # تخزين النتيجة في الكاش
         self.cache.set(cache_key, result, ttl_seconds=settings.PREDICTION_TTL)
         return result
 
@@ -341,7 +313,6 @@ class PredictionModel:
         future = (datetime.utcnow() + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
         statuses = "SCHEDULED,TIMED"
         fixtures = self._get_competition_matches(comp_id, today, future, status=statuses)
-        # فلترة للتأكد من وجود هويات الفرق
         fixtures = [
             m
             for m in fixtures
@@ -351,10 +322,6 @@ class PredictionModel:
         return fixtures_sorted
 
     def predict_bulk_for_scheduled(self, comp_id: int, horizon_days: int, advanced_settings: Dict) -> List[Dict]:
-        """
-        يبني السياق مرة واحدة ثم يحسب توقع كل مباراة قادمة ضمن الأفق الزمني المحدد.
-        يستخدم أسماء الفرق من نفس استجابة المباريات لتقليل طلبات HTTP.
-        """
         elo_scale = float(advanced_settings.get("elo_scale", settings.ELO_SCALE))
         prior_games = int(advanced_settings.get("prior_games", settings.PRIOR_GAMES))
         max_goals_grid = int(advanced_settings.get("max_goals_grid", settings.MAX_GOALS_GRID))
@@ -362,7 +329,6 @@ class PredictionModel:
         lookback_days = int(advanced_settings.get("lookback_days", settings.DEFAULT_LOOKBACK_DAYS))
         history_match_limit = int(advanced_settings.get("history_match_limit", settings.HISTORY_MATCH_LIMIT))
 
-        # كاش للنتيجة الجماعية
         cache_key = (
             f"bulk:{settings.VERSION}:{comp_id}:{horizon_days}:{elo_scale:.3f}:{prior_games}:{max_goals_grid}:"
             f"{use_season_dates}:{lookback_days}:{history_match_limit}"
@@ -428,31 +394,17 @@ class PredictionModel:
                     "context": {"date_from": ctx["date_from"], "date_to": ctx["date_to"]},
                 },
                 "date": date_iso,
-                "teams": {
-                    "home": {"id": h, "name": home_name},
-                    "away": {"id": a, "name": away_name},
-                },
+                "teams": {"home": {"id": h, "name": home_name}, "away": {"id": a, "name": away_name}},
                 "lambdas": {"home_final": round(lam_home_final, 3), "away_final": round(lam_away_final, 3)},
                 "elo": {"home_rating": round(Rh), "away_rating": round(Ra)},
                 "probabilities": {
-                    "1x2": {
-                        "home": round(p_home * 100, 1),
-                        "draw": round(p_draw * 100, 1),
-                        "away": round(p_away * 100, 1),
-                    },
-                    "over_under": {
-                        "over_2_5": round(prob_over_2_5 * 100, 1),
-                        "under_2_5": round((1 - prob_over_2_5) * 100, 1),
-                    },
-                    "btts": {
-                        "yes": round(prob_btts_yes * 100, 1),
-                        "no": round((1 - prob_btts_yes) * 100, 1),
-                    },
+                    "1x2": {"home": round(p_home * 100, 1), "draw": round(p_draw * 100, 1), "away": round(p_away * 100, 1)},
+                    "over_under": {"over_2_5": round(prob_over_2_5 * 100, 1), "under_2_5": round((1 - prob_over_2_5) * 100, 1)},
+                    "btts": {"yes": round(prob_btts_yes * 100, 1), "no": round((1 - prob_btts_yes) * 100, 1)},
                     "top_scorelines": top_scorelines,
                 },
             }
             results.append(result)
 
-        # كاش النتائج الجماعية
         self.cache.set(cache_key, results, ttl_seconds=settings.PREDICTION_TTL)
         return results
