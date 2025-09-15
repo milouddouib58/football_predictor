@@ -21,6 +21,10 @@ def parse_date_safe(s: Optional[str]):
 
 
 def ewma_weight(match_date_iso: str, ref_date_iso: str, half_life_days: int) -> float:
+    """
+    Calculates the exponential weight of a match based on its age.
+    A match with age equal to half_life_days will have a weight of 0.5.
+    """
     md = parse_date_safe(match_date_iso)
     rd = parse_date_safe(ref_date_iso)
     if not md or not rd or half_life_days <= 0:
