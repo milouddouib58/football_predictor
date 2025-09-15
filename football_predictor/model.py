@@ -8,6 +8,12 @@ from football_predictor.utils import clamp, log, poisson_pmf
 
 
 class PredictionModel:
+    """
+    منطق الجلب والتحليل والتوقع:
+    - جلب المباريات القادمة للبطولة (SCHEDULED/TIMED).
+    - بناء سياق مشترك (A/D/ELO/متوسطات) وفق نافذة التاريخ وحدود المباريات.
+    - توقع مباراة واحدة أو توقع جماعي لكل المباريات القادمة.
+    """
     def __init__(self, client: FootballDataClient, cache: AnalysisCache):
         self.client = client
         self.cache = cache
@@ -38,6 +44,10 @@ class PredictionModel:
         return None
 
     def _get_competition_matches(self, comp_id: int, date_from: str, date_to: str, status: str = "FINISHED") -> List[Dict]:
+        """
+        يجلب مباريات البطولة ضمن نطاق تاريخ وحالة محددة.
+        status يمكن أن تكون قيمة مفردة أو متعددة مفصولة بفواصل مثل: 'SCHEDULED,TIMED'
+        """
         log(f"Fetching matches for competition {comp_id} [{status}] {date_from}..{date_to}")
         params = {"competitions": comp_id, "status": status, "dateFrom": date_from, "dateTo": date_to}
         ttl = settings.MATCHES_TTL if "FINISHED" in status else settings.SCHEDULED_TTL
@@ -314,8 +324,7 @@ class PredictionModel:
         statuses = "SCHEDULED,TIMED"
         fixtures = self._get_competition_matches(comp_id, today, future, status=statuses)
         fixtures = [
-            m
-            for m in fixtures
+            m for m in fixtures
             if (m.get("homeTeam") or {}).get("id") and (m.get("awayTeam") or {}).get("id")
         ]
         fixtures_sorted = sorted(fixtures, key=lambda x: x.get("utcDate", ""))
