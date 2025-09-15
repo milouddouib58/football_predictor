@@ -2,4 +2,5 @@ streamlit
 requests
 pydantic
 python_dotenv
+PredictionModel
 
