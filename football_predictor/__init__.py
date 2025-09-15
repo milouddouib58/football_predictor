@@ -1,1 +1,3 @@
-# file: football_predictor/__init__.py
+from .settings import VERSION
+
+__all__ = ["VERSION"]
